@@ -61,6 +61,11 @@ internal constructor(
 
   private val mutex = Mutex()
 
+  // Some vendor builds (seen on Xiaomi HyperOS / MediaTek MT6789) remove an autonomous GO group
+  // after ~10 seconds when no client has joined (wpa_supplicant: P2P-GROUP-REMOVED reason=IDLE).
+  // While the broadcast is running we hold the channel here and recreate the group if it vanishes.
+  @Volatile private var activeChannel: Channel? = null
+
   private data class WiFiDirectInternalTeardownResult(
       val errorReasons: List<WiFiDirectError.Reason>,
       val success: Boolean,
@@ -387,12 +392,16 @@ internal constructor(
         throw e
       }
 
+      activeChannel = channel
       return@withLock channel
     }
   }
 
   override suspend fun withLockStopBroadcast(source: Channel) {
     enforcer.assertOffMainThread()
+
+    // Stop the keep-alive loop before tearing the group down on purpose
+    activeChannel = null
 
     return mutex.withLock {
       // This may fail if WiFi is off, but that's fine since if WiFi is off,
@@ -420,7 +429,11 @@ internal constructor(
     val info = wiFiP2PManager.requestConnectionInfo(source)
     val host = info?.groupOwnerAddress
 
-    return if (host == null) {
+    return if (host == null && activeChannel === source) {
+      // Group was removed by the system while running, keep-alive will recreate it
+      Timber.w { "Connection Info missing while running, waiting for group recreation" }
+      BroadcastNetworkStatus.ConnectionInfo.Unchanged
+    } else if (host == null) {
       BroadcastNetworkStatus.ConnectionInfo.Error(
           error = IllegalStateException("WiFi Direct did not return Connection Info"),
       )
@@ -448,7 +461,11 @@ internal constructor(
     enforcer.assertOffMainThread()
     val group = wiFiP2PManager.requestGroupInfo(channel = source)
 
-    return if (group == null) {
+    return if (group == null && activeChannel === source) {
+      // Group was removed by the system while running, keep-alive will recreate it
+      Timber.w { "Group Info missing while running, waiting for group recreation" }
+      BroadcastNetworkStatus.GroupInfo.Unchanged
+    } else if (group == null) {
       BroadcastNetworkStatus.GroupInfo.Error(
           error = IllegalStateException("WiFi Direct did not return Group Info"),
       )
@@ -476,6 +493,37 @@ internal constructor(
       connectionStatus: Flow<BroadcastNetworkStatus.ConnectionInfo>,
   ) {
     scope.launch(context = dispatchers.default) { register.register() }
+    scope.launch(context = dispatchers.default) { keepGroupAlive() }
+  }
+
+  /** Recreate the group if the system removes it while the broadcast is still running */
+  private suspend fun keepGroupAlive() {
+    while (true) {
+      delay(KEEP_ALIVE_INTERVAL)
+
+      val channel = activeChannel ?: return
+      if (wiFiP2PManager.requestGroupInfo(channel) != null) {
+        continue
+      }
+
+      Timber.w { "Wi-Fi Direct group was removed by the system, recreating" }
+      mutex.withLock {
+        // Broadcast may have been stopped while we waited for the lock
+        if (activeChannel !== channel) {
+          return
+        }
+
+        try {
+          createGroup(channel)
+          Timber.d { "Wi-Fi Direct group recreated" }
+        } catch (e: CancellationException) {
+          throw e
+        } catch (@LintIgnoreTooGenericExceptionCaught e: Exception) {
+          // Try again on the next round
+          Timber.w(e) { "Failed to recreate Wi-Fi Direct group" }
+        }
+      }
+    }
   }
 
   class WifiDirectChannelCreationException :
@@ -495,6 +543,9 @@ internal constructor(
 
     // Wait just a little bit between tries for the Wi-Fi Direct to settl
     private val BUSY_RETRY_DELAY = 500.milliseconds
+
+    // How often to check that the group still exists while running
+    private val KEEP_ALIVE_INTERVAL = 2000.milliseconds
 
     @JvmStatic
     private fun closeSilent(s: Channel) {
