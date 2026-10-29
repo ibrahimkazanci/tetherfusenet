@@ -38,6 +38,7 @@ import com.pyamsoft.tetherfi.server.event.ServerShutdownEvent
 import com.pyamsoft.tetherfi.server.lock.Locker
 import com.pyamsoft.tetherfi.server.proxy.manager.ProxyManager
 import com.pyamsoft.tetherfi.server.status.RunningStatus
+import java.util.concurrent.atomic.AtomicInteger
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.time.Duration.Companion.seconds
@@ -75,6 +76,11 @@ internal constructor(
 ) : BaseServer(status), SharedProxy {
 
   private val overallState = MutableStateFlow(ProxyState())
+
+  // When the proxy is restarted (e.g. Wi-Fi Direct group recreated on a new interface), the old
+  // server loop can report onClosing/onClosed after the new one has opened. Only the latest loop
+  // may change the status.
+  private val currentLoopId = AtomicInteger(0)
 
   private fun adjustState(type: SharedProxy.Type, ready: Boolean) {
     overallState.update { s ->
@@ -116,11 +122,14 @@ internal constructor(
   ) {
     enforcer.assertOffMainThread()
 
+    val loopId = currentLoopId.incrementAndGet()
+    val isCurrentLoop = { loopId == currentLoopId.get() }
+
     try {
       val port = preferences.listenForPortChanges().first()
 
       Timber.d {
-        "${type.name} Begin proxy server loop: $info ($port)"
+        "${type.name} Begin proxy server loop: $info ($port) loop=$loopId"
       }
       factory
           .create(
@@ -132,15 +141,23 @@ internal constructor(
           )
           .loop(
               lock = lock,
-              onOpened = { readyState(type) },
+              onOpened = { if (isCurrentLoop()) readyState(type) },
               onClosing = {
-                // Closing, we mark as stopping early
-                status.set(RunningStatus.Stopping)
-                unreadyState(type)
+                if (isCurrentLoop()) {
+                  // Closing, we mark as stopping early
+                  status.set(RunningStatus.Stopping)
+                  unreadyState(type)
+                } else {
+                  Timber.d { "Ignore onClosing from replaced proxy loop=$loopId" }
+                }
               },
               onClosed = {
-                Timber.d { "Proxy Server is Done!" }
-                broadcastProxyStop()
+                if (isCurrentLoop()) {
+                  Timber.d { "Proxy Server is Done!" }
+                  broadcastProxyStop()
+                } else {
+                  Timber.d { "Ignore onClosed from replaced proxy loop=$loopId" }
+                }
               },
               onError = { e -> e.ifNotCancellation { handleServerLoopError(e = e, type = type) } },
           )
