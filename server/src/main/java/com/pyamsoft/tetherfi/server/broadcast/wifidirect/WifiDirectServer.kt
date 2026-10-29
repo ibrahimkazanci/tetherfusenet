@@ -31,11 +31,13 @@ import com.pyamsoft.tetherfi.core.LintIgnoreThrowsCount
 import com.pyamsoft.tetherfi.core.Timber
 import com.pyamsoft.tetherfi.server.ServerInternalApi
 import com.pyamsoft.tetherfi.server.broadcast.BroadcastNetworkStatus
+import com.pyamsoft.tetherfi.server.broadcast.BroadcastNetworkUpdater
 import com.pyamsoft.tetherfi.server.broadcast.BroadcastServerImplementation
 import com.pyamsoft.tetherfi.server.broadcast.DelegatingBroadcastServer
 import com.pyamsoft.tetherfi.server.lock.Locker
 import java.net.InetAddress
 import javax.inject.Inject
+import javax.inject.Provider
 import javax.inject.Singleton
 import kotlin.time.Duration.Companion.milliseconds
 import kotlinx.coroutines.CancellationException
@@ -57,6 +59,8 @@ internal constructor(
     private val wiFiP2PManager: SuspendingWiFiP2PManager,
     private val enforcer: ThreadEnforcer,
     private val dispatchers: AppDispatchers,
+    // Provider breaks the cycle: the updater (DelegatingBroadcastServer) depends on this class
+    private val networkUpdater: Provider<BroadcastNetworkUpdater>,
 ) : BroadcastServerImplementation<Channel> {
 
   private val mutex = Mutex()
@@ -65,6 +69,10 @@ internal constructor(
   // after ~10 seconds when no client has joined (wpa_supplicant: P2P-GROUP-REMOVED reason=IDLE).
   // While the broadcast is running we hold the channel here and recreate the group if it vanishes.
   @Volatile private var activeChannel: Channel? = null
+
+  // Each recreated group lives on a new p2p interface, and the proxy socket bound to the old one
+  // stops accepting (EINVAL). Bumping this makes the proxy restart on the new interface.
+  @Volatile private var groupGeneration = 0
 
   private data class WiFiDirectInternalTeardownResult(
       val errorReasons: List<WiFiDirectError.Reason>,
@@ -440,6 +448,7 @@ internal constructor(
     } else {
       BroadcastNetworkStatus.ConnectionInfo.Connected(
           hostName = host.hostAddress.orEmpty(),
+          generation = groupGeneration,
       )
     }
   }
@@ -507,21 +516,31 @@ internal constructor(
       }
 
       Timber.w { "Wi-Fi Direct group was removed by the system, recreating" }
-      mutex.withLock {
-        // Broadcast may have been stopped while we waited for the lock
-        if (activeChannel !== channel) {
-          return
-        }
+      val recreated =
+          mutex.withLock {
+            // Broadcast may have been stopped while we waited for the lock
+            if (activeChannel !== channel) {
+              return
+            }
 
-        try {
-          createGroup(channel)
-          Timber.d { "Wi-Fi Direct group recreated" }
-        } catch (e: CancellationException) {
-          throw e
-        } catch (@LintIgnoreTooGenericExceptionCaught e: Exception) {
-          // Try again on the next round
-          Timber.w(e) { "Failed to recreate Wi-Fi Direct group" }
-        }
+            try {
+              createGroup(channel)
+              groupGeneration += 1
+              Timber.d { "Wi-Fi Direct group recreated, generation=$groupGeneration" }
+              true
+            } catch (e: CancellationException) {
+              throw e
+            } catch (@LintIgnoreTooGenericExceptionCaught e: Exception) {
+              // Try again on the next round
+              Timber.w(e) { "Failed to recreate Wi-Fi Direct group" }
+              false
+            }
+          }
+
+      if (recreated) {
+        // Network info refreshes are debounced, wait out the window so this one is not skipped
+        delay(NETWORK_INFO_REFRESH_DELAY)
+        networkUpdater.get().updateNetworkInfo()
       }
     }
   }
@@ -546,6 +565,9 @@ internal constructor(
 
     // How often to check that the group still exists while running
     private val KEEP_ALIVE_INTERVAL = 2000.milliseconds
+
+    // Slightly longer than DelegatingBroadcastServer.REFRESH_DEBOUNCE (3 seconds)
+    private val NETWORK_INFO_REFRESH_DELAY = 3500.milliseconds
 
     @JvmStatic
     private fun closeSilent(s: Channel) {

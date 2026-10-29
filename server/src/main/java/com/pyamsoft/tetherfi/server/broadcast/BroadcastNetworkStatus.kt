@@ -85,6 +85,9 @@ interface BroadcastNetworkStatus : Server {
     @VisibleForTesting(otherwise = VisibleForTesting.PACKAGE_PRIVATE)
     constructor(
         val hostName: String,
+        // Bumped when the Wi-Fi Direct group is recreated on a new interface with the same
+        // address, so collectors using distinctUntilChanged() restart the proxy server
+        val generation: Int = 0,
     ) : ConnectionInfo {
 
       private data class NotAnIpAddressException(val hostName: String) :
